@@ -27,41 +27,66 @@ def world_to_grid(x, y):
     y_idx = int(y // cell_size) + grid_height // 2
     return x_idx, y_idx
 
-# Update the grid using LiDAR data
-def process_lidar_data(point_cloud):
-    print(f"[DEBUG] Processing {len(point_cloud)} LiDAR points")
-    for point in point_cloud:
-        x, y, z = point[0], point[1], point[2]
-        if z < 0.5:  # Ignore points below 0.5 meters (likely ground)
-            continue
-        x_idx, y_idx = world_to_grid(x, y)
-        if 0 <= x_idx < grid_width and 0 <= y_idx < grid_height:
-            occupancy_grid[x_idx, y_idx] = 1
-
-# Update the grid using depth camera data
+# Improved depth processing
 def process_depth_image(image):
+    # CARLA depth is encoded in RGB channels (0-1 normalized)
     array = np.frombuffer(image.raw_data, dtype=np.uint8)
     array = array.reshape((image.height, image.width, 4))
-    depth = array[:, :, 0].astype(np.float32)
-    depth = (depth / 255.0) * 20.0  # depth scale (max 20 meters)
-    print(f"[DEBUG] Depth image shape: {depth.shape}, max depth: {np.max(depth)}")
-    # Camera parameters
-    fov = 90.0  # degrees
-    fx = fy = (image.width / 2) / np.tan(np.radians(fov / 2))
+    depth = (array[:, :, :3].astype(np.float32) @ [1.0, 256.0, 65536.0]) / (256**3 - 1)
+    depth *= 1000  # Convert to meters
+    
+    print(f"[DEBUG] Depth range: {depth.min():.2f}m - {depth.max():.2f}m")
+    
+    # Camera projection parameters
+    fov = 90.0
+    fx = (image.width / 2) / np.tan(np.radians(fov / 2))
+    fy = fx
     cx, cy = image.width / 2, image.height / 2
-    for i in range(0, image.height, 2):  # Finer sampling: every 2 pixels
-        for j in range(0, image.width, 2):
+    
+    # Sample every 4th pixel for performance
+    step = 4
+    for i in range(0, image.height, step):
+        for j in range(0, image.width, step):
             d = depth[i, j]
-            if d < 0.1:  # Ignore very close depth values (likely noise)
-                continue
-            # Convert pixel to world coordinates
-            x = d * (j - cx) / fx
-            y = d * (i - cy) / fy
+            if 0.5 < d < 50.0:  # Valid range
+                # Convert to vehicle coordinates (X forward, Y left, Z up)
+                x = d
+                y = (j - cx) * d / fx
+                z = (i - cy) * d / fy
+                
+                # Filter ground and noise
+                if z > 0.3:  # 30cm above ground
+                    x_idx, y_idx = world_to_grid(x, y)
+                    if 0 <= x_idx < grid_width and 0 <= y_idx < grid_height:
+                        occupancy_grid[x_idx, y_idx] = 1
+
+# Improved LiDAR processing
+def process_lidar_data(point_cloud):
+    points = np.frombuffer(point_cloud.raw_data, dtype=np.float32).reshape(-1, 4)
+    print(f"[DEBUG] LiDAR points: {len(points)}")
+    
+    for point in points:
+        x, y, z = point[0], point[1], point[2]
+        if z > 0.3:  # 30cm above ground
             x_idx, y_idx = world_to_grid(x, y)
             if 0 <= x_idx < grid_width and 0 <= y_idx < grid_height:
-                occupancy_grid[x_idx, y_idx] = 1
+                occupancy_grid[x_idx, y_idx] = min(occupancy_grid[x_idx, y_idx] + 1, 3)  # Accumulate hits
 
-# A* path planning algorithm
+# Enhanced visualization
+def visualize_grid(grid, path=None):
+    plt.figure(figsize=(10, 10))
+    plt.imshow(grid.T, origin='lower', cmap='hot', interpolation='nearest')
+    if path:
+        px, py = zip(*path)
+        plt.plot(px, py, 'b-', linewidth=2, label='Path')
+    plt.colorbar(label='Occupancy')
+    plt.title("Enhanced Occupancy Grid")
+    plt.xlabel("X (cells)")
+    plt.ylabel("Y (cells)")
+    plt.grid(True)
+    plt.show()
+
+# A* path planning algorithm with 8-directional movement
 def a_star(start, goal, grid):
     open_set = []
     heapq.heappush(open_set, (0, start))
@@ -80,12 +105,14 @@ def a_star(start, goal, grid):
             path.reverse()
             return path
         x, y = current
-        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:  # 4-directional movement
+        # 8-directional movement
+        for dx, dy in [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]:
             neighbor = (x + dx, y + dy)
             if (0 <= neighbor[0] < grid.shape[0] and
                 0 <= neighbor[1] < grid.shape[1] and
-                grid[neighbor] == 0):  # Check if cell is free
-                tentative_g = g_score[current] + 1
+                grid[neighbor] == 0):
+                cost = 1.414 if dx != 0 and dy != 0 else 1
+                tentative_g = g_score[current] + cost
                 if neighbor not in g_score or tentative_g < g_score[neighbor]:
                     came_from[neighbor] = current
                     g_score[neighbor] = tentative_g
@@ -134,9 +161,7 @@ print("[INFO] Depth camera spawned")
 
 # Sensor callbacks
 def lidar_callback(data, grid_ref):
-    points = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4)
-    print(f"[DEBUG] LiDAR points shape: {points.shape}")
-    process_lidar_data(points)
+    process_lidar_data(data)
 
 def depth_callback(image, grid_ref):
     process_depth_image(image)
@@ -153,25 +178,18 @@ lidar.stop()
 depth_cam.stop()
 
 # Debug occupancy grid
-print(f"[DEBUG] Occupancy grid non-zero count: {np.sum(occupancy_grid)}")
+print(f"[DEBUG] Occupancy grid non-zero count: {np.sum(occupancy_grid > 0)}")
+print(f"[DEBUG] Max occupancy value: {np.max(occupancy_grid)}")
 
 # Plan path using A*
-start = (5, 5)
-goal = (80, 80)
+start = (50, 50)  # Near vehicle starting position
+goal = (70, 70)   # Nearby goal
+print(f"[DEBUG] Start cell ({start}) occupied: {occupancy_grid[start] > 0}")
+print(f"[DEBUG] Goal cell ({goal}) occupied: {occupancy_grid[goal] > 0}")
 path = a_star(start, goal, occupancy_grid)
 
 # Visualize the grid and path
-plt.figure(figsize=(8, 8))
-plt.imshow(occupancy_grid.T, origin='lower', cmap='gray')
-if path:
-    px, py = zip(*path)
-    plt.plot(px, py, color='red', linewidth=2, label='A* Path')
-else:
-    print("[WARNING] No path found by A* algorithm")
-plt.title("Occupancy Grid + A* Path")
-plt.legend()
-plt.grid(True)
-plt.show()
+visualize_grid(occupancy_grid, path)
 
 # Cleanup
 vehicle.set_autopilot(False)
